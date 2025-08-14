@@ -1,0 +1,7 @@
+__pycache__/
+.vscode/
+.env
+TODO
+raw_data/
+logs/
+.cache
