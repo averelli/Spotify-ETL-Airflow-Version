@@ -43,10 +43,7 @@ def create_staging_task_groups(item:str, task_group:str):
             for batch in batch_results:
                 if batch["processed_items"] == 0:
                     failed_items.extend(batch["failed_items"])
-
-            print(f"First way fetching: {batch_results}")
-            second_way = context["ti"].xcom_pull(task_ids=f"spotify_items_staging.{task_group}.stage_{item}s.process_batch_task")
-            print(f"Second way fetching: {second_way}")
+                    
             if failed_items:
                 return f"spotify_items_staging.{task_group}.stage_{item}s.retry_items_task"
             else:
