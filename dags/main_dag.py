@@ -96,6 +96,7 @@ def load_dims_task_groups(item_type:str):
 
     return load_dim
 
+
 with DAG("spotify_etl_dag", schedule_interval=None, catchup=False):
     # Tasks to read raw data files and load them into staging
     with TaskGroup("raw_files_extraction") as raw_files_extraction:
@@ -161,8 +162,67 @@ with DAG("spotify_etl_dag", schedule_interval=None, catchup=False):
 
     with TaskGroup("data_transformation") as data_transformation:
         DIMENTSION_ITEM_TYPES = ["tracks", "artists", "podcasts", "episodes"]
-        for item_type in DIMENTSION_ITEM_TYPES:
-            load_dim = load_dims_task_groups(item_type)
+        FACT_ITEM_TYPES = ["track", "podcast"]
+        
+        with TaskGroup("load_spotify_dims") as load_spotify_dims:
+            for item_type in DIMENTSION_ITEM_TYPES:
+                load_dim = load_dims_task_groups(item_type)
+
+        @task
+        def log_spoti_dims_load(**context):
+            logger = LoggingMixin().log
+            ti = context["ti"]
+            dim_stats = {item_type: {
+                                    "total_time": 0,
+                                    "processed_count": 0
+                                } for item_type in DIMENTSION_ITEM_TYPES}
+            
+            for item_type in DIMENTSION_ITEM_TYPES:
+                batch_results = ti.xcom_pull(task_ids=f"data_transformation.load_spotify_dims.load_{item_type}_dim.core_batch_task")
+                if batch_results:
+                    total_time = sum(batch[0] for batch in batch_results)
+                    processed_count = sum(batch[1] for batch in batch_results)
+                    dim_stats[item_type]["total_time"] = total_time
+                    dim_stats[item_type]["processed_count"] = processed_count
+
+            logger.info(f"Spotify dims loaded: {dim_stats}")
+            return dim_stats
+        spoti_dim_stats = log_spoti_dims_load()
+
+        @task(trigger_rule="none_failed")
+        def populate_dim_reason_task():
+            db = PgConnectHook()
+            logger = LoggingMixin().log
+            return populate_dim_reason(db, logger)
+        run_populate_dim_reason = populate_dim_reason_task()
+        
+        with TaskGroup("load_facts") as load_spotify_facts:
+            @task
+            def insert_core_facts_task(item_type):
+                db = PgConnectHook()
+                logger = LoggingMixin().log
+                return insert_core_facts(db, logger, item_type)
+            insert_track_facts = insert_core_facts_task.override(task_id="insert_track_facts")("track")
+            insert_podcast_facts = insert_core_facts_task.override(task_id="insert_podcast_facts")("podcast")
+
+            @task
+            def log_facts_load(**context):
+                logger = LoggingMixin().log
+                ti = context["ti"]
+                track_time = ti.xcom_pull(task_ids="data_transformation.load_facts.insert_track_facts")
+                podcast_time = ti.xcom_pull(task_ids="data_transformation.load_facts.insert_podcast_facts")
+                logger.info(f"Track facts loaded in {track_time} seconds, Podcast facts loaded in {podcast_time} seconds, total time: {track_time + podcast_time} seconds")
+                return {
+                    "track_time": track_time,
+                    "podcast_time": podcast_time,
+                    "total_time": track_time + podcast_time
+                }
+            run_log_facts_load = log_facts_load()
+
+            insert_track_facts >> run_log_facts_load
+            insert_podcast_facts >> run_log_facts_load
+
+        load_spotify_dims >> spoti_dim_stats >> run_populate_dim_reason >> load_spotify_facts
 
     raw_files_extraction >> skip_staging_check >> [run_spotify_items_staging, run_transformation] 
     run_spotify_items_staging >> spotify_items_staging >> run_transformation
