@@ -147,3 +147,24 @@ class PgConnectHook(PostgresHook):
         self.log.info(f"Max timestamp from core and staging: {max_ts}")
 
         return max_ts
+    
+    def load_staged_batch(self, item_type:str, batch_ids:list) -> list:
+        """
+        Loads a batch of items from the database for processing.
+
+        Args:
+            item_type (str): Type of item to load (e.g., 'track', 'artist', 'podcast').
+            batch_ids (list): List of item ids to load.
+
+        Returns:
+            list: List of tuples containing record_id and raw data for each item.
+        """
+        query = f"SELECT record_id, raw_data FROM staging.spotify_{item_type}_data WHERE record_id IN %s;"
+        items = self.execute_query(query, (tuple(batch_ids),))
+        
+        if not items:
+            self.log.warning(f"No items found for {item_type} with ids {batch_ids}")
+            return []
+        
+        self.log.info(f"Loaded {len(items)} items for {item_type} from the database")
+        return items
