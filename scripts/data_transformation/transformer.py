@@ -117,3 +117,136 @@ def core_batch(db, logger, item_type:str, batch_ids:list) -> (tuple[float, int])
     logger.info(f"All batches processed successfully in {total_time} seconds. Inserted {total_items_count} {item_type}")
     
     return total_time, total_items_count
+
+
+def populate_dim_reason(db, logger) -> float:
+        """
+        Repopulates dim_reason in case there are new reasons added
+        Args:
+            db: Database connection hook.
+            logger: Logger instance.
+        Returns:
+            int: total time.
+        """
+        start_time = time.perf_counter()
+        logger.info("Started repopulating dim_reason")
+
+        try:
+            query = """
+            INSERT INTO core.dim_reason (reason_type, reason_group)
+            SELECT DISTINCT reason_start AS reason_type, 'start' AS reason_group FROM staging.streaming_history
+            UNION ALL
+            SELECT DISTINCT reason_end, 'end' AS reason_group FROM staging.streaming_history
+            ON CONFLICT DO NOTHING;
+            """
+            db.execute_query(query)
+
+            total_time = round(time.perf_counter() - start_time, 2)
+            logger.info(f"Finished repopulating dim_reason, took {total_time} seconds")
+            return total_time
+
+        except Exception as e:
+            logger.error(f"Error while repopulating dim_reason: {e}")
+            raise
+
+
+def insert_core_facts(db, logger, item_type:str) -> float:
+        """
+        Loads new fact records into the core fact table for the specified item type.
+        
+        For item_type "track" or "podcast", this function executes an INSERT query that
+        joins the staging table with the appropriate dimension tables to generate fully transformed fact rows. It uses a delta load
+        approach based on the maximum timestamp already present in the fact table.        
+        Args:
+            db: Database connection hook.
+            logger: Logger instance.
+            item_type (str): The type of fact to load, either "track" or "podcast".            
+        Returns:
+            float: The time taken to execute the insertion.
+        Raises:
+            ValueError: If an invalid item type is provided.
+        """
+        # metrics
+        time_start = time.perf_counter()
+        row_count = 0
+
+        logger.info(f"Started inserting data into fact_{item_type}s_history")
+
+        if item_type == "track":
+            query = """
+            INSERT INTO core.fact_tracks_history (
+            ts_msk, date_fk, time_fk, ms_played, sec_played, 
+            track_fk, artist_fk, reason_start_fk, reason_end_fk, 
+            shuffle, percent_played, offline, offline_timestamp
+            )
+            SELECT
+                s.ts AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Moscow' AS ts_msk,
+                d.date_id,
+                t.time_id,
+                s.ms_played,
+                s.ms_played / 1000,
+                dt.track_id,
+                da.artist_id,
+                rs.reason_id,
+                re.reason_id,
+                s.shuffle,
+                round(s.ms_played::numeric / NULLIF(dt.duration_ms, 0) * 100, 1),
+                s.offline,
+                s.offline_timestamp
+            FROM staging.streaming_history s
+            LEFT JOIN core.dim_date d ON d.date = (s.ts AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Moscow')::date
+            LEFT JOIN core.dim_time t ON t.time = date_trunc('minute', s.ts AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Moscow')::time
+            LEFT JOIN core.dim_track dt ON s.spotify_track_uri = dt.spotify_track_uri
+            LEFT JOIN core.dim_artist da ON dt.spotify_artist_uri = da.spotify_artist_uri
+            LEFT JOIN core.dim_reason rs ON s.reason_start = rs.reason_type AND rs.reason_group = 'start'
+            LEFT JOIN core.dim_reason re ON s.reason_end = re.reason_type AND re.reason_group = 'end'
+            WHERE 
+                s.spotify_track_uri IS NOT NULL 
+                AND 
+                s.ts > (
+                SELECT COALESCE(MAX(ts_msk AT TIME ZONE 'Europe/Moscow' AT TIME ZONE 'UTC'), '1900-01-01'::timestamp)
+                FROM core.fact_tracks_history
+            );
+            """
+        elif item_type == "podcast":
+            query = """
+            INSERT INTO core.fact_podcasts_history (ts_msk, date_fk, time_fk, sec_played, episode_fk, podcast_fk, reason_start_fk, reason_end_fk)
+            SELECT
+                s.ts AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Moscow' AS ts_msk,
+                d.date_id,
+                t.time_id,
+                s.ms_played / 1000,
+                COALESCE(de.episode_id, 0),
+                COALESCE(dp.podcast_id, 0),
+                rs.reason_id,
+                re.reason_id
+            FROM staging.streaming_history s
+            LEFT JOIN core.dim_date d ON d.date = (s.ts AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Moscow')::date
+            LEFT JOIN core.dim_time t ON t.time = date_trunc('minute', s.ts AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Moscow')::time
+            LEFT JOIN core.dim_episode de ON s.spotify_episode_uri = de.spotify_episode_uri
+            LEFT JOIN core.dim_podcast dp ON de.spotify_podcast_uri = dp.spotify_podcast_uri
+            LEFT JOIN core.dim_reason rs ON s.reason_start = rs.reason_type AND rs.reason_group = 'start'
+            LEFT JOIN core.dim_reason re ON s.reason_end = re.reason_type AND re.reason_group = 'end'
+            WHERE
+                s.spotify_episode_uri IS NOT NULL
+                AND
+                s.ts > (
+                    SELECT COALESCE(MAX(ts_msk AT TIME ZONE 'Europe/Moscow' AT TIME ZONE 'UTC'), '1900-01-01'::timestamp)
+                    FROM core.fact_podcasts_history
+            );
+            """
+        else:
+            logger.error(f"Invalid item type passed. Expected 'track' or 'podcast', got: {item_type}")
+            raise ValueError(f"Invalid item type passed. Expected 'track' or 'podcast', got: {item_type}")
+        
+        try:
+            row_count = db.execute_query(query, return_rowcount=True)
+
+            total_time = round(time.perf_counter() - time_start, 2)
+            logger.info(f"Inserted {row_count} rows into fact_tracks_history in {total_time} seconds")
+
+            return total_time
+        
+        except Exception as e:
+            logger.error(f"Error while inserting data into fact_{item_type}s_history: {e}")
+            raise
