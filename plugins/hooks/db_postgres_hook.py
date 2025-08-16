@@ -16,16 +16,20 @@ class PgConnectHook(PostgresHook):
             self.log.error(f"Error getting DB connection or cursor: {e}")
             raise
 
-    def execute_query(self, query, params=None, manual_fetch:bool=False):
+    def execute_query(self, query, params=None, manual_fetch:bool=False, return_rowcount:bool=False):
         """
         Execute a single query.
 
         Args:
             query (str): SQL qeury to execute
             params (tuple): params to insert into the query, None by default
-
+            manual_fetch (bool): If True, fetch results manually, default False
+            return_rowcount (bool): If True, return the row count of the executed query, default False
         Returns:
-            list: result of SELECT queries
+            list | int | None:
+                - If manual_fetch is True or query starts with "select", returns the fetched rows.
+                - If return_rowcount is True, returns the number of affected rows.
+                - Otherwise, returns None.
         """
         conn, cursor = self._get_cursor()
 
@@ -38,6 +42,10 @@ class PgConnectHook(PostgresHook):
 
             if query.strip().upper().startswith("SELECT") or manual_fetch:
                 return cursor.fetchall()
+            elif return_rowcount:
+                return cursor.rowcount
+            else:
+                return None
             
         except Exception as e:
             self.log.error(f"Error executing query: {e}")
