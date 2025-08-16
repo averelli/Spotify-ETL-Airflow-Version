@@ -1,10 +1,14 @@
 from airflow import DAG
-from airflow.decorators import task
+from airflow.decorators import task, short_circuit
 from airflow.utils.task_group import TaskGroup
 from airflow.operators.empty import EmptyOperator
 from airflow.exceptions import AirflowSkipException
 from scripts.data_extraction.raw_data_extractor import *
 from scripts.data_extraction.spotify_items_staging import *
+from scripts.data_transformation.transformer import *
+from scripts.utils import split_into_batches
+from hooks.db_postgres_hook import PgConnectHook
+from hooks.spotify_api_hook import SpotifyClientHook
 
 def create_staging_task_groups(item:str, task_group:str):
     with TaskGroup(f"stage_{item}s") as stage_item:
@@ -13,8 +17,9 @@ def create_staging_task_groups(item:str, task_group:str):
             return get_new_items(item)
 
         @task
-        def split_into_batches_task(items):
-            return split_into_batches(items, batch_size=50)
+        def split_into_staging_batches_task(items):
+            logger = LoggingMixin().log
+            return split_into_batches(logger, items, batch_size=50)
         
         @task
         def process_batch_task(batch):
@@ -50,7 +55,7 @@ def create_staging_task_groups(item:str, task_group:str):
                 return f"spotify_items_staging.{task_group}.stage_{item}s.item_group_final_log_task"
             
         items = get_new_items_task()
-        batches = split_into_batches_task(items)
+        batches = split_into_staging_batches_task(items)
         batch_results = process_batch_task.expand(batch=batches)
         errors_check = check_errors_task(batch_results)
         retry_output = retry_items_task()
@@ -61,6 +66,35 @@ def create_staging_task_groups(item:str, task_group:str):
         retry_output >> final_log
 
     return stage_item
+
+def load_dims_task_groups(item_type:str):
+    with TaskGroup(f"load_{item_type}_dim") as load_dim:
+        @task
+        def get_staged_items_task():
+            db = PgConnectHook()
+            logger = LoggingMixin().log
+            staged_items = get_staged_items(db, logger, item_type)
+            return staged_items
+
+        @task 
+        def split_into_core_batches_task(staged_items):
+            logger = LoggingMixin().log
+            return split_into_batches(logger, staged_items, batch_size=50)
+        
+        @task 
+        def core_batch_task(batch):
+            db = PgConnectHook()
+            logger = LoggingMixin().log
+            batch_time, batch_count = core_batch(db, logger, item_type, batch)
+            return batch_time, batch_count
+        
+        staged_items = get_staged_items_task()
+        batches = split_into_core_batches_task(staged_items)
+        batch_results = core_batch_task.expand(batch=batches)
+
+        staged_items >> batches >> batch_results
+
+    return load_dim
 
 with DAG("spotify_etl_dag", schedule_interval=None, catchup=False):
     # Tasks to read raw data files and load them into staging
@@ -79,30 +113,57 @@ with DAG("spotify_etl_dag", schedule_interval=None, catchup=False):
         
         @task 
         def extraction_final_log_task(extraction_stats):
-            status = extraction_final_log(extraction_stats)
-            if status == "Skip downstream":
-                raise AirflowSkipException("No new data to process, skipping downstream tasks.")
-
+            return extraction_final_log(extraction_stats)
+            
         files_list = get_files_list_task()
         max_ts = get_max_ts_task()
         extraction_stats = extract_raw_data_task.partial(max_ts=max_ts).expand(file_name=files_list)
         final_log = extraction_final_log_task(extraction_stats)
 
         [files_list, max_ts] >> extraction_stats >> final_log
+
+    @task.branch
+    def skip_staging_tasks(raw_extraction_status):
+        if raw_extraction_status == "Skip downstream tasks":
+            return "run_spotify_items_staging"
+        else:
+            return "run_transformation"
+
+    skip_staging_check = skip_staging_tasks(final_log)
+    run_spotify_items_staging = EmptyOperator(task_id="run_spotify_items_staging")
+    run_transformation = EmptyOperator(task_id="run_transformation", trigger_rule="none_failed")
     
+    # Stage Spotify items in batches
     with TaskGroup("spotify_items_staging") as spotify_items_staging:
+
         SPOTIFY_ITEM_TYPES = ["track", "episode", "artist", "podcast"] # ORDER IS IMPORTANT HERE: tracks before artists, episodes before podcasts
+
         with TaskGroup("stage_tracks_and_episodes") as stage_tracks_and_episodes:
             for item in SPOTIFY_ITEM_TYPES[0:2]: # First stage only tracks and episodes
                 create_staging_task_groups(item, task_group="stage_tracks_and_episodes")
 
         # Dummy task to ensure that if the first group is skipped (all items already staged), the second group still runs
-        dummy_success = EmptyOperator(task_id="dummy_success", trigger_rule="none_failed")
+        @task.branch(trigger_rule="none_failed")
+        def run_second_group_task(**context):
+            raw_extraction_status = context["ti"].xcom_pull(task_ids="raw_files_extraction.extraction_final_log_task")
+            if raw_extraction_status != "Skip downstream":
+                return "spotify_items_staging.run_stage_artists_and_podcasts"
+            else:
+                raise AirflowSkipException("Skipping artists and podcasts staging as raw extraction status is 'Skip downstream tasks'")
+        run_second_group_check = run_second_group_task()
+        run_stage_artists_and_podcasts = EmptyOperator(task_id="dummy_success")
 
         with TaskGroup("stage_artists_and_podcasts") as stage_artists_and_podcasts:
             for item in SPOTIFY_ITEM_TYPES[2:]: # Then stage artists and podcasts
                 create_staging_task_groups(item, "stage_artists_and_podcasts")
         
-        stage_tracks_and_episodes >> dummy_success >> stage_artists_and_podcasts
-                    
-    raw_files_extraction >> spotify_items_staging
+        stage_tracks_and_episodes >> run_second_group_check >> run_stage_artists_and_podcasts >> stage_artists_and_podcasts
+
+    with TaskGroup("data_transformation") as data_transformation:
+        DIMENTSION_ITEM_TYPES = ["tracks", "artists", "podcasts", "episodes"]
+        for item_type in DIMENTSION_ITEM_TYPES:
+            load_dim = load_dims_task_groups(item_type)
+
+    raw_files_extraction >> skip_staging_check >> [run_spotify_items_staging, run_transformation] 
+    run_spotify_items_staging >> spotify_items_staging >> run_transformation
+    run_transformation >> data_transformation
