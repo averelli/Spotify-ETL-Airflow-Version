@@ -1,23 +1,21 @@
-from hooks.db_postgres_hook import PgConnectHook
 from hooks.spotify_api_hook import SpotifyClientHook
-from airflow.utils.log.logging_mixin import LoggingMixin
 from spotipy.exceptions import SpotifyException
 import time
 
 
-def get_new_items(entity_type: str):
+def get_new_items(db, logger, entity_type: str):
         """
         Returns a list of only the new unique items from the staged data, 
         excluding those already in the core and previous staging history.
 
         Args:
+            db (PgConnectHook): Database connection hook
+            logger (LoggingMixin): Logger instance
             entity_type (str): `track`, `episode`, `artist`, `podcast`
         Returns:
             list: new items to process
         """
-        logger = LoggingMixin().log
         logger.info(f"Getting new items for {entity_type}")
-        db = PgConnectHook()
 
         # URIs already staged in history. All items from the raw data. The biggest set
         if entity_type in ["artist", "podcast"]:
@@ -36,10 +34,13 @@ def get_new_items(entity_type: str):
         return new_items
 
 
-def process_spotify_batch(batch: list, item_type:str, retry_limit:int = 2) -> dict:
+def process_spotify_batch(db, logger, sp:SpotifyClientHook, batch: list, item_type:str, retry_limit:int = 2) -> dict:
         """
         Process a single batch of tracks or episodes.
         Args:
+            db (PgConnectHook): Database connection hook
+            logger (LoggingMixin): Logger instance
+            sp (SpotifyClientHook): Spotify API client hook
             batch (list): a list of Spotify URIs to process
             item_type (str): `track`, `episode`, `artist` or `podcast`
             retry_limit (int): Number of retries allowed before failing. 2 by default
@@ -48,10 +49,6 @@ def process_spotify_batch(batch: list, item_type:str, retry_limit:int = 2) -> di
             {"status": str, "processed_items": int, "failed_items": list, "processing_time": float}
 
         """
-        # setup the hooks
-        db = PgConnectHook()
-        logger = LoggingMixin().log
-        sp = SpotifyClientHook()
 
         # API call function for each type
         api_calls = {
@@ -162,21 +159,19 @@ def process_spotify_batch(batch: list, item_type:str, retry_limit:int = 2) -> di
         }
 
 
-def retry_items(items:list, item_type:str):
+def retry_items(db, logger, sp:SpotifyClientHook, items:list, item_type:str):
     """
     Retries failed items
 
     Args:
+        db (PgConnectHook): Database connection hook
+        logger (LoggingMixin): Logger instance  
+        sp (SpotifyClientHook): Spotify API client hook
         items (list): List of items to retry.
         item_type (str): Type of the item, can be `track`, `episode`, `artist` or `podcast`.
     Returns:
         tuple[int, int]: A tuple containing the number of valid and invalid items.
     """
-    # setup the hooks
-    db = PgConnectHook()
-    logger = LoggingMixin().log
-    sp = SpotifyClientHook()
-
     start_time = time.perf_counter()
 
     invalid_uris = []
@@ -224,18 +219,24 @@ def retry_items(items:list, item_type:str):
         "processing_time": end_time
     }
 
-def item_group_final_log(extraction_stats: list, item_type: str, retry_stats: dict=None):
+def item_group_final_log(logger, extraction_stats: list, item_type: str, retry_stats: dict=None):
     """
     Logs the final statistics of the item extraction process.
 
     Args:
+        logger (LoggingMixin): Logger instance
         extraction_stats (list): List of dicts containing the stats for each batch
         retry_stats (dict): Dict containing the stats for the retry_items function
         item_type (str): Type of the item, can be `track`, `episode`, `artist` or `podcast`
     """
-    logger = LoggingMixin().log
     total_processed = sum(stat["processed_items"] for stat in extraction_stats) + retry_stats.get("processed_items", 0)
     total_failed = retry_stats.get("failed_items", 0)
     total_time = sum(stat["processing_time"] for stat in extraction_stats) + retry_stats.get("processing_time", 0)
 
     logger.info(f"Extraction completed for {item_type}s: {total_processed} items processed, {total_failed} items failed, total time: {total_time:.2f} seconds")
+
+    return {
+        "total_processed": total_processed,
+        "total_failed": total_failed,
+        "total_time": total_time
+    }

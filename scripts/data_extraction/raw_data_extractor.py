@@ -1,5 +1,4 @@
 from hooks.db_postgres_hook import PgConnectHook
-from airflow.utils.log.logging_mixin import LoggingMixin
 from datetime import datetime, timezone
 import json
 import glob
@@ -12,19 +11,26 @@ def get_raw_files_list(raw_data_path: str) -> list:
     return glob.glob(raw_data_path + "/*.json")
 
 
-def get_max_ts() -> datetime:
+def get_max_ts(db:PgConnectHook) -> datetime:
     """
     Retrieves the maximum timestamp from the database.
+    Args:
+        db (PgConnectHook): Database connection hook
     """
-    db = PgConnectHook()
     return db.get_max_history_ts()
 
 
-def extract_streaming_history(file_name:str, max_ts:datetime):
+def extract_streaming_history(db:PgConnectHook, logger, file_name:str, max_ts:datetime):
+    """
+    Extracts streaming history data from a JSON file and inserts it into the database.
+    
+    Args:
+        db (PgConnectHook): Database connection hook
+        logger (LoggingMixin): Logger instance
+        file_name (str): Path to the JSON file containing streaming history data.
+        max_ts (datetime): Maximum timestamp from the database to filter new records.
+    """
     start_time = time.time()
-
-    db = PgConnectHook()
-    logger = LoggingMixin().log
 
     logger.info(f"Started processing file: {file_name}")
     try:
@@ -83,17 +89,33 @@ def extract_streaming_history(file_name:str, max_ts:datetime):
         logger.error(f"Unexpected error processing {file_name}: {str(e)}", exc_info=True)
 
 
-def extraction_final_log(extraction_stats: list):
-    logger = LoggingMixin().log
+def extraction_final_log(logger, extraction_stats: list) -> dict:
+    """
+    Logs the final statistics of the extraction process.
+    Args:
+        logger (LoggingMixin): Logger instance
+        extraction_stats (list): List of dicts containing the stats for each file processed
+    Returns:
+        dict: Summary of the extraction process {message: str, total_time: float}
+    """
     total_files = len(extraction_stats)
     total_records = sum(stat["records_count"] for stat in extraction_stats)
     total_time = sum(stat["processing_time"] for stat in extraction_stats)
 
     if total_files == 0:
         logger.warning("No files processed during extraction")
-        return "Skip downstream"
+        return {
+            "message": "Skip downstream",
+            "total_time": total_time
+        }
     elif total_records == 0:
-        return "Skip downstream"
+        return {
+            "message": "Skip downstream",
+            "total_time": total_time
+        }
     else:
         logger.info(f"Extraction complete. Processed {total_files} files, {total_records} total records in {total_time:.2f} seconds.")
-        return "Continue downstream"
+        return {
+            "message": "Continue downstream",
+            "total_time": total_time
+        }
