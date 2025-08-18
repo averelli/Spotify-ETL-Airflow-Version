@@ -250,3 +250,32 @@ def insert_core_facts(db, logger, item_type:str) -> float:
         except Exception as e:
             logger.error(f"Error while inserting data into fact_{item_type}s_history: {e}")
             raise
+
+def cleanup_staging(db, logger) -> float:
+        """
+        Cleans up staging layer. Streaming history is truncated, in other tables rows are deleted if 'is_processed' is marked as TRUE.
+        
+        Args:
+            db: Database connection hook.
+            logger: Logger instance.
+        Returns:
+            float: total time to finish the process.
+        """
+        start_time = time.perf_counter()
+        logger.info("Started staging cleaning up process.")
+
+        with db.transaction() as tx_cursor:
+            try:
+                tx_cursor.execute("TRUNCATE TABLE staging.streaming_history;")
+                tx_cursor.execute("DELETE FROM staging.spotify_tracks_data WHERE is_processed = TRUE;")
+                tx_cursor.execute("DELETE FROM staging.spotify_episodes_data WHERE is_processed = TRUE;")
+                tx_cursor.execute("DELETE FROM staging.spotify_artists_data WHERE is_processed = TRUE;")
+                tx_cursor.execute("DELETE FROM staging.spotify_podcasts_data WHERE is_processed = TRUE;")
+                
+                logger.info("Staging cleanup completed successfully.")
+                total_time = round(time.perf_counter() - start_time, 2)
+
+                return total_time
+            except Exception as e:
+                logger.error(f"Error during staging cleanup: {e}", exc_info=True)
+                raise
