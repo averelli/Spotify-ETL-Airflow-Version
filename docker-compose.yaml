@@ -1,0 +1,69 @@
+x-airflow-common:
+  &airflow-common
+  image: apache/airflow:2.9.1
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@airflow-postgres:5432/${POSTGRES_DB}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_WWW_USER_USERNAME}
+    _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_WWW_USER_PASSWORD}
+    PYTHONPATH: /opt/airflow
+    _PIP_ADDITIONAL_REQUIREMENTS: "spotipy"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./scripts:/opt/airflow/scripts
+    - ./raw_data:/opt/airflow/raw_data
+  depends_on:
+    - airflow-postgres
+
+services:
+  airflow-postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  dwh-postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${DWH_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${DWH_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${DWH_POSTGRES_DB}
+    volumes:
+      - dwh_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+
+  airflow-init:
+    <<: *airflow-common
+    command: >
+      bash -c "
+        airflow db upgrade &&
+        airflow users create --username ${AIRFLOW_WWW_USER_USERNAME} --password ${AIRFLOW_WWW_USER_PASSWORD} \
+          --firstname Air --lastname Flow --role Admin \
+          --email ${AIRFLOW_WWW_USER_EMAIL}
+      "
+
+  airflow-webserver:
+    <<: *airflow-common
+    ports:
+      - "8080:8080"
+    command: webserver
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+
+volumes:
+  postgres_data:
+  dwh_postgres_data:
+
+
